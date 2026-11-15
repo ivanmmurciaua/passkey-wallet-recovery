@@ -1,0 +1,37 @@
+{
+  "name": "passkey-wallet-recovery",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "eslint",
+    "check:constants": "tsx scripts/check-constants.ts"
+  },
+  "dependencies": {
+    "@safe-global/protocol-kit": "^8.0.11",
+    "@safe-global/relay-kit": "^6.1.5",
+    "next": "16.4.6",
+    "react": "19.3.1",
+    "react-dom": "19.3.1",
+    "viem": "^2.57.20"
+  },
+  "devDependencies": {
+    "@noble/curves": "^1.9.7",
+    "@nomicfoundation/hardhat-viem": "^3.1.0",
+    "@types/node": "^22",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "dotenv": "^18.0.10",
+    "eslint": "^9",
+    "eslint-config-next": "16.4.6",
+    "hardhat": "^3.22.0",
+    "ts-node": "^10.9.2",
+    "tsx": "^4.19.2",
+    "typescript": "^5.9.3"
+  },
+  "type": "module",
+  "license": "Apache-2.0",
+  "description": "Recoverable passkey smart wallets: rotate a lost WebAuthn signer without the old device, keeping the same address and funds."
+}

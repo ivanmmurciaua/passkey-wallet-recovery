@@ -1,0 +1,11 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "noEmit": false,
+    "outDir": ".hardhat-dist"
+  },
+  "include": ["hardhat.config.ts", "scripts/**/*.ts"],
+  "exclude": ["node_modules", "src"]
+}
