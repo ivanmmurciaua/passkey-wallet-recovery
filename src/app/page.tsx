@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { PocState, StepStatus } from "@/types";
 import { createPasskey, toPasskeyArg } from "@/lib/passkeys";
 import { toHex } from "viem";
@@ -18,6 +18,10 @@ import {
   defaultVerifiers,
 } from "@/lib/recovery";
 import { RECOVERY_MODULE_ADDRESS } from "@/app/constants";
+import { startRarimo, kRecoveryToOwner, waitForRarimoEnrollment, RARIMO_GROUP, RecoveryFactor, type RarimoSession } from "@/lib/rarimo";
+import { exportKRecovery, importKRecovery } from "@/lib/keybackup";
+import FactorBuilder from "@/components/FactorBuilder";
+import RarimoScan from "@/components/RarimoScan";
 import { PasskeyArgType } from "@safe-global/protocol-kit";
 import { Safe4337Pack } from "@safe-global/relay-kit";
 
@@ -41,12 +45,40 @@ function ts() {
   return new Date().toISOString().slice(11, 23);
 }
 
+function downloadJson(filename: string, text: string) {
+  const blob = new Blob([text], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+// Where the recovery key comes from. Step 2 creates it, step 3 obtains it again.
+type CreateSource = "rarimo" | "random";
+type RestoreSource = "rarimo" | "backup" | "paste";
+
 export default function PocPage() {
   const [state, setState] = useState<PocState>(empty);
   const [packA, setPackA] = useState<Safe4337Pack | null>(null);
   const [logs, setLogs] = useState<Log[]>([]);
   const [statuses, setStatuses] = useState<Record<string, StepStatus>>({});
   const [recoveryKeyInput, setRecoveryKeyInput] = useState("");
+
+  // Recovery key sources. Rarimo regenerates the same key from the user's factors (never
+  // stored); the encrypted backup and the raw key are sovereign fallbacks.
+  const [createSource, setCreateSource] = useState<CreateSource>("rarimo");
+  const [restoreSource, setRestoreSource] = useState<RestoreSource>("rarimo");
+  // Rarimo recipe, shared by create (step 2) and restore (step 3): same factors, same order.
+  const [factors, setFactors] = useState<RecoveryFactor[]>([RecoveryFactor.Password]);
+  const [rarimoUrl, setRarimoUrl] = useState<string | null>(null);
+  const sessionRef = useRef<RarimoSession | null>(null);
+  // Recovery key kept in memory after step 2, only to offer the encrypted backup.
+  const [kRecovery, setKRecovery] = useState<string | null>(null);
+  const [backupPwd, setBackupPwd] = useState("");
+  const [importFileText, setImportFileText] = useState("");
+  const [importPwd, setImportPwd] = useState("");
 
   // Import fields for existing credentials (Step 1 Option A)
   const [importSafeAddress, setImportSafeAddress] = useState("");
@@ -178,15 +210,46 @@ export default function PocPage() {
 
   // ── Step 2: Setup Recovery Key ───────────────────────────────────────────
 
+  // Run one Rarimo session (create or restore) and return the recovery key it hands back.
+  async function runRarimo(mode: "create" | "restore", walletAddress?: string): Promise<string> {
+    if (factors.length === 0) throw new Error("Add at least one recovery factor");
+    log(`Starting Rarimo ${mode.toUpperCase()} (group "${RARIMO_GROUP}", factors [${factors.join(",")}])...`);
+    const session = await startRarimo(mode, factors, walletAddress);
+    sessionRef.current = session;
+    setRarimoUrl(session.url);
+    log(mode === "create" ? "Scan the QR with the Rarimo app and complete your factors..." : "Scan the QR with the Rarimo app and reproduce the same factors...");
+    try {
+      return await session.waitForKey();
+    } finally {
+      sessionRef.current = null;
+      setRarimoUrl(null);
+    }
+  }
+
   async function step2() {
     setStatus("s2", "loading");
     try {
       if (!packA || !state.safeAddress) throw new Error("Complete Step 1 first");
 
-      log("Generating recovery key...");
-      const { privateKey, address } = generateRecoveryKey();
-      log(`Recovery address: ${address}`);
-      setState((s) => ({ ...s, recoveryAddress: address, recoveryPrivateKey: privateKey }));
+      let privateKey: `0x${string}`;
+      let address: `0x${string}`;
+      if (createSource === "rarimo") {
+        const K = await runRarimo("create");
+        ({ privateKey, address } = kRecoveryToOwner(K));
+        log(`Recovery address (from Rarimo K_recovery): ${address}`);
+        // CREATE handing back a key does not mean Rarimo persisted the enrollment. Confirm it
+        // on Rarimo L2 before trusting the key, or a later RESTORE has nothing to find.
+        log("Confirming the Rarimo enrollment on Rarimo L2 (~15s blocks)...");
+        await waitForRarimoEnrollment(address);
+        log("Rarimo enrollment confirmed on-chain ✓");
+        setKRecovery(privateKey);
+      } else {
+        log("Generating a random recovery key (dev mode)...");
+        ({ privateKey, address } = generateRecoveryKey() as { privateKey: `0x${string}`; address: `0x${string}` });
+        log(`Recovery address: ${address}`);
+        setKRecovery(privateKey);
+      }
+      setState((s) => ({ ...s, recoveryAddress: address, recoveryPrivateKey: createSource === "random" ? privateKey : "" }));
 
       log("Sending UserOp: setupRecovery(recoveryKey)...");
       const hash = await sendUserOp(packA, [
@@ -208,8 +271,23 @@ export default function PocPage() {
       setState((s) => ({ ...s, recoverySetup: true }));
       setStatus("s2", "done");
     } catch (e: unknown) {
+      sessionRef.current?.cancel();
+      sessionRef.current = null;
+      setRarimoUrl(null);
       log(e instanceof Error ? e.message : String(e), true);
       setStatus("s2", "error");
+    }
+  }
+
+  async function downloadBackup() {
+    try {
+      if (!kRecovery) throw new Error("No recovery key in memory");
+      if (!backupPwd) throw new Error("Enter a password for the backup");
+      const blob = await exportKRecovery(kRecovery, backupPwd);
+      downloadJson("recovery-key-backup.json", blob);
+      log("Encrypted recovery key backup downloaded (Argon2id + AES-256-GCM)");
+    } catch (e: unknown) {
+      log(e instanceof Error ? e.message : String(e), true);
     }
   }
 
@@ -219,16 +297,38 @@ export default function PocPage() {
     setStatus("s3", "loading");
     try {
       if (!state.safeAddress) throw new Error("Complete Step 1 first");
-      if (!recoveryKeyInput.startsWith("0x") || recoveryKeyInput.length !== 66) {
+      if (restoreSource === "backup" && (!importFileText || !importPwd)) throw new Error("Load the backup file and enter its password");
+      if (restoreSource === "paste" && !/^0x[0-9a-fA-F]{64}$/.test(recoveryKeyInput.trim())) {
         throw new Error("Enter the recovery private key (0x + 64 hex chars)");
       }
 
+      // Passkey B first: WebAuthn needs a fresh user activation, before any await on Rarimo polling.
       log("Creating Passkey B (new passkey)...");
       const { coords } = await createPasskey("passkey-B");
       log(`Passkey B rawId: ${coords.rawId}`);
       log(`Passkey B X: ${coords.x}`);
       log(`Passkey B Y: ${coords.y}`);
       setState((s) => ({ ...s, passkeyB: coords }));
+
+      // Obtain the recovery key from the chosen source.
+      const registered = await getRecoveryKey(state.safeAddress);
+      let K: string;
+      if (restoreSource === "rarimo") {
+        // walletAddress = the registered recovery address: Rarimo's restore disambiguator.
+        K = await runRarimo("restore", registered);
+        log("Recovery key restored from Rarimo.");
+      } else if (restoreSource === "backup") {
+        log("Decrypting the backup file with its password...");
+        K = await importKRecovery(importFileText, importPwd);
+        log("Recovery key recovered from the encrypted backup.");
+      } else {
+        K = recoveryKeyInput.trim();
+      }
+      const recovery = kRecoveryToOwner(K);
+      if (recovery.address.toLowerCase() !== registered.toLowerCase()) {
+        throw new Error(`This recovery key is ${recovery.address}, but the Safe has ${registered} registered`);
+      }
+      log(`Recovery key matches the one registered on-chain (${registered}) ✓`);
 
       log("Reading SharedSigner config BEFORE rotation...");
       const currentConfig = await getSharedSignerConfig(state.safeAddress);
@@ -247,7 +347,7 @@ export default function PocPage() {
 
       log("Signing EIP-712 recovery digest with recovery key...");
       const signature = await signRecovery({
-        privateKey: recoveryKeyInput as `0x${string}`,
+        privateKey: recovery.privateKey,
         safeAddress: state.safeAddress,
         newX: BigInt(coords.x),
         newY: BigInt(coords.y),
@@ -280,6 +380,9 @@ export default function PocPage() {
       setState((s) => ({ ...s, rotationDone: true }));
       setStatus("s3", "done");
     } catch (e: unknown) {
+      sessionRef.current?.cancel();
+      sessionRef.current = null;
+      setRarimoUrl(null);
       log(e instanceof Error ? e.message : String(e), true);
       setStatus("s3", "error");
     }
@@ -494,37 +597,71 @@ export default function PocPage() {
       {/* Step 2 */}
       <section style={sectionStyle}>
         <h2>{icon(statuses["s2"])} Step 2: Setup Recovery Key</h2>
-        <p>Generates a random recovery EOA and registers it on the RecoveryModule via UserOp.</p>
-        {state.recoveryAddress && (
-          <>
-            <p>Recovery address: <code>{state.recoveryAddress}</code></p>
-            <p style={{ color: "#c00" }}>
-              ⚠ Save this private key: you need it in Step 3:<br />
-              <code style={{ wordBreak: "break-all" }}>{state.recoveryPrivateKey}</code>
-            </p>
-          </>
+        <p>Creates the recovery key and registers its address on the RecoveryModule via UserOp.</p>
+        <div style={{ margin: "8px 0", fontSize: "13px" }}>
+          <label><input type="radio" checked={createSource === "rarimo"} onChange={() => setCreateSource("rarimo")} disabled={state.recoverySetup} /> Rarimo Unforgettable (regenerated from your factors, never stored)</label>
+          <br />
+          <label><input type="radio" checked={createSource === "random"} onChange={() => setCreateSource("random")} disabled={state.recoverySetup} /> Random key (dev mode: you must copy it)</label>
+        </div>
+        {createSource === "rarimo" && (
+          <FactorBuilder factors={factors} onChange={setFactors} disabled={statuses["s2"] === "loading" || state.recoverySetup} />
+        )}
+        {rarimoUrl && statuses["s2"] === "loading" && <RarimoScan url={rarimoUrl} />}
+        {state.recoveryAddress && <p>Recovery address: <code>{state.recoveryAddress}</code></p>}
+        {state.recoveryPrivateKey && (
+          <p style={{ color: "#c00" }}>
+            ⚠ Save this private key: you need it in Step 3:<br />
+            <code style={{ wordBreak: "break-all" }}>{state.recoveryPrivateKey}</code>
+          </p>
         )}
         {state.recoverySetup && <p style={okStyle}>Recovery configured ✓</p>}
         <button onClick={step2} disabled={!state.moduleEnabled || statuses["s2"] === "loading" || state.recoverySetup} style={btnStyle}>
-          {statuses["s2"] === "loading" ? "Working..." : "Generate & Setup"}
+          {statuses["s2"] === "loading" ? "Working..." : createSource === "rarimo" ? "Create with Rarimo & Setup" : "Generate & Setup"}
         </button>
+        {state.recoverySetup && kRecovery && (
+          <div style={{ marginTop: "10px", fontSize: "13px" }}>
+            <p>Optional: download an encrypted backup of the recovery key (Argon2id + AES-256-GCM).</p>
+            <input type="password" placeholder="backup password" value={backupPwd} onChange={(e) => setBackupPwd(e.target.value)} style={{ fontFamily: "monospace", padding: "4px", marginRight: "6px" }} />
+            <button onClick={downloadBackup} style={btnStyle}>Download encrypted backup</button>
+          </div>
+        )}
       </section>
 
       {/* Step 3 */}
       <section style={sectionStyle}>
         <h2>{icon(statuses["s3"])} Step 3: Rotate Passkey (simulate lost device)</h2>
-        <p>Creates Passkey B, signs a recovery digest with the recovery key, and relays the rotation.</p>
-        <div style={{ margin: "8px 0" }}>
-          <label style={{ fontSize: "13px" }}>Recovery private key (from Step 2):</label>
+        <p>Creates Passkey B, obtains the recovery key again, signs the recovery digest and relays the rotation.</p>
+        <div style={{ margin: "8px 0", fontSize: "13px" }}>
+          <label><input type="radio" checked={restoreSource === "rarimo"} onChange={() => setRestoreSource("rarimo")} disabled={state.rotationDone} /> Rarimo restore (same factors, same order)</label>
           <br />
-          <input
-            type="text"
-            placeholder="0x..."
-            value={recoveryKeyInput}
-            onChange={(e) => setRecoveryKeyInput(e.target.value)}
-            style={{ width: "100%", fontFamily: "monospace", fontSize: "12px", padding: "4px", marginTop: "4px" }}
-          />
+          <label><input type="radio" checked={restoreSource === "backup"} onChange={() => setRestoreSource("backup")} disabled={state.rotationDone} /> Encrypted backup file + password</label>
+          <br />
+          <label><input type="radio" checked={restoreSource === "paste"} onChange={() => setRestoreSource("paste")} disabled={state.rotationDone} /> Paste the private key</label>
         </div>
+        {restoreSource === "rarimo" && (
+          <FactorBuilder factors={factors} onChange={setFactors} disabled={statuses["s3"] === "loading" || state.rotationDone} />
+        )}
+        {restoreSource === "backup" && (
+          <div style={{ margin: "8px 0", fontSize: "13px" }}>
+            <input type="file" accept="application/json" onChange={async (e) => setImportFileText((await e.target.files?.[0]?.text()) ?? "")} />
+            <br />
+            <input type="password" placeholder="backup password" value={importPwd} onChange={(e) => setImportPwd(e.target.value)} style={{ fontFamily: "monospace", padding: "4px", marginTop: "6px" }} />
+          </div>
+        )}
+        {restoreSource === "paste" && (
+          <div style={{ margin: "8px 0" }}>
+            <label style={{ fontSize: "13px" }}>Recovery private key (from Step 2):</label>
+            <br />
+            <input
+              type="text"
+              placeholder="0x..."
+              value={recoveryKeyInput}
+              onChange={(e) => setRecoveryKeyInput(e.target.value)}
+              style={{ width: "100%", fontFamily: "monospace", fontSize: "12px", padding: "4px", marginTop: "4px" }}
+            />
+          </div>
+        )}
+        {rarimoUrl && statuses["s3"] === "loading" && <RarimoScan url={rarimoUrl} />}
         {state.passkeyB && <p>Passkey B created ✓ x={state.passkeyB.x.slice(0, 16)}...</p>}
         {state.rotationDone && <p style={okStyle}>Rotation complete ✓</p>}
         <button onClick={step3} disabled={!state.recoverySetup || statuses["s3"] === "loading" || state.rotationDone} style={btnStyle}>

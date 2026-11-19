@@ -43,6 +43,21 @@ export const P256_PRECOMPILE = 0x0100n;
 export const PACKED_VERIFIERS = (P256_PRECOMPILE << 160n) | BigInt(CANONICAL.daimoP256Verifier);
 export const PACKED_VERIFIERS_HEX = toHex(PACKED_VERIFIERS);
 
+// ── Rarimo Unforgettable (optional source of the recovery key) ──────────────────────────
+
+export const RARIMO = {
+  /** Rarimo L2, where the HelperDataFactory records each enrollment. */
+  l2Rpc: "https://l2.rarimo.com/",
+  /** Enrollment registry: getAccountInfo(addr).metadata != 0 once an enrollment is committed. */
+  helperDataFactory: "0x032c562b3fc67B94c67955Ac89e19dd238D6c724" as Address,
+  /**
+   * Domain separator of the recovery key. Must be identical in create and restore or Rarimo
+   * returns a different key. Kept as the group of Rarimo's own demo until a custom group is
+   * confirmed to work end to end.
+   */
+  group: "rarimo-poc-demo",
+} as const;
+
 // ── Networks ────────────────────────────────────────────────────────────────────────────
 
 export type NetworkKey = "sepolia" | "baseSepolia" | "arbitrumSepolia";

@@ -10,9 +10,13 @@
     "check:constants": "tsx scripts/check-constants.ts"
   },
   "dependencies": {
+    "@distributedlab/jac": "^1.0.0-rc.17",
+    "@noble/hashes": "^1.8.0",
+    "@rarimo/unforgettable-sdk": "^1.1.0-rc.1",
     "@safe-global/protocol-kit": "^8.0.11",
     "@safe-global/relay-kit": "^6.1.5",
     "next": "16.4.6",
+    "qrcode": "^1.5.4",
     "react": "19.3.1",
     "react-dom": "19.3.1",
     "viem": "^2.57.20"
@@ -21,6 +25,7 @@
     "@noble/curves": "^1.9.7",
     "@nomicfoundation/hardhat-viem": "^3.1.0",
     "@types/node": "^22",
+    "@types/qrcode": "^1.5.6",
     "@types/react": "^19",
     "@types/react-dom": "^19",
     "dotenv": "^18.0.10",
