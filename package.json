@@ -10,6 +10,7 @@
     "check:constants": "tsx scripts/check-constants.ts"
   },
   "dependencies": {
+    "@noble/hashes": "^1.8.0",
     "@safe-global/protocol-kit": "^8.0.11",
     "@safe-global/relay-kit": "^6.1.5",
     "next": "16.4.6",

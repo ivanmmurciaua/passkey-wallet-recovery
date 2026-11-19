@@ -18,6 +18,8 @@ import {
   defaultVerifiers,
 } from "@/lib/recovery";
 import { RECOVERY_MODULE_ADDRESS } from "@/app/constants";
+import { exportKRecovery, importKRecovery } from "@/lib/keybackup";
+import { privateKeyToAccount } from "viem/accounts";
 import { PasskeyArgType } from "@safe-global/protocol-kit";
 import { Safe4337Pack } from "@safe-global/relay-kit";
 
@@ -41,12 +43,39 @@ function ts() {
   return new Date().toISOString().slice(11, 23);
 }
 
+function downloadJson(filename: string, text: string) {
+  const blob = new Blob([text], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+// Where step 3 obtains the recovery key again.
+type RestoreSource = "backup" | "paste";
+
+/** Validate a 0x + 64-hex secp256k1 private key and return it with its address. */
+function toRecoveryKey(k: string): { privateKey: `0x${string}`; address: `0x${string}` } {
+  const key = k.trim();
+  if (!/^0x[0-9a-fA-F]{64}$/.test(key)) throw new Error("The recovery key must be 0x + 64 hex chars");
+  const privateKey = key.toLowerCase() as `0x${string}`;
+  return { privateKey, address: privateKeyToAccount(privateKey).address }; // throws on an invalid scalar
+}
+
 export default function PocPage() {
   const [state, setState] = useState<PocState>(empty);
   const [packA, setPackA] = useState<Safe4337Pack | null>(null);
   const [logs, setLogs] = useState<Log[]>([]);
   const [statuses, setStatuses] = useState<Record<string, StepStatus>>({});
   const [recoveryKeyInput, setRecoveryKeyInput] = useState("");
+
+  // Encrypted backup of the recovery key: offered after step 2, consumed in step 3.
+  const [restoreSource, setRestoreSource] = useState<RestoreSource>("backup");
+  const [backupPwd, setBackupPwd] = useState("");
+  const [importFileText, setImportFileText] = useState("");
+  const [importPwd, setImportPwd] = useState("");
 
   // Import fields for existing credentials (Step 1 Option A)
   const [importSafeAddress, setImportSafeAddress] = useState("");
@@ -198,8 +227,15 @@ export default function PocPage() {
       ]);
       log(`UserOp hash: ${hash}`);
 
+      // The public RPC is load-balanced: a node behind the one that served the receipt can still
+      // return the old value (seen on Sepolia: 0x0 right after a successful setupRecovery).
+      // Re-read for a few seconds before concluding there is a mismatch.
       log("Verifying on-chain: recoveryKeys[safe]...");
-      const storedKey = await getRecoveryKey(state.safeAddress);
+      let storedKey = await getRecoveryKey(state.safeAddress);
+      for (let i = 0; i < 10 && storedKey.toLowerCase() !== address.toLowerCase(); i++) {
+        await new Promise((r) => setTimeout(r, 1500));
+        storedKey = await getRecoveryKey(state.safeAddress);
+      }
       log(`Stored recovery key: ${storedKey}`);
       if (storedKey.toLowerCase() !== address.toLowerCase()) {
         throw new Error(`On-chain key mismatch: expected ${address}, got ${storedKey}`);
@@ -213,15 +249,44 @@ export default function PocPage() {
     }
   }
 
+  async function downloadBackup() {
+    try {
+      if (!state.recoveryPrivateKey) throw new Error("No recovery key in memory");
+      if (!backupPwd) throw new Error("Enter a password for the backup");
+      log("Encrypting the recovery key (Argon2id + AES-256-GCM)...");
+      const blob = await exportKRecovery(state.recoveryPrivateKey, backupPwd);
+      downloadJson("recovery-key-backup.json", blob);
+      log("Encrypted recovery key backup downloaded");
+    } catch (e: unknown) {
+      log(e instanceof Error ? e.message : String(e), true);
+    }
+  }
+
   // ── Step 3: Rotate Passkey ───────────────────────────────────────────────
 
   async function step3() {
     setStatus("s3", "loading");
     try {
       if (!state.safeAddress) throw new Error("Complete Step 1 first");
-      if (!recoveryKeyInput.startsWith("0x") || recoveryKeyInput.length !== 66) {
-        throw new Error("Enter the recovery private key (0x + 64 hex chars)");
+      if (restoreSource === "backup" && (!importFileText || !importPwd)) throw new Error("Load the backup file and enter its password");
+      if (restoreSource === "paste") toRecoveryKey(recoveryKeyInput); // fail fast, before creating Passkey B
+
+      // Obtain the recovery key and check it against the one registered on-chain BEFORE creating
+      // Passkey B or signing anything: a wrong password or another Safe's backup stops here.
+      let K: string;
+      if (restoreSource === "backup") {
+        log("Decrypting the backup file with its password...");
+        K = await importKRecovery(importFileText, importPwd);
+        log("Recovery key recovered from the encrypted backup.");
+      } else {
+        K = recoveryKeyInput;
       }
+      const recovery = toRecoveryKey(K);
+      const registered = await getRecoveryKey(state.safeAddress);
+      if (recovery.address.toLowerCase() !== registered.toLowerCase()) {
+        throw new Error(`This recovery key is ${recovery.address}, but the Safe has ${registered} registered`);
+      }
+      log(`Recovery key matches the one registered on-chain (${registered}) ✓`);
 
       log("Creating Passkey B (new passkey)...");
       const { coords } = await createPasskey("passkey-B");
@@ -247,7 +312,7 @@ export default function PocPage() {
 
       log("Signing EIP-712 recovery digest with recovery key...");
       const signature = await signRecovery({
-        privateKey: recoveryKeyInput as `0x${string}`,
+        privateKey: recovery.privateKey,
         safeAddress: state.safeAddress,
         newX: BigInt(coords.x),
         newY: BigInt(coords.y),
@@ -508,23 +573,43 @@ export default function PocPage() {
         <button onClick={step2} disabled={!state.moduleEnabled || statuses["s2"] === "loading" || state.recoverySetup} style={btnStyle}>
           {statuses["s2"] === "loading" ? "Working..." : "Generate & Setup"}
         </button>
+        {state.recoverySetup && state.recoveryPrivateKey && (
+          <div style={{ marginTop: "10px", fontSize: "13px" }}>
+            <p>Download an encrypted backup of the recovery key (Argon2id + AES-256-GCM). Step 3 can restore it with the password.</p>
+            <input type="password" placeholder="backup password" value={backupPwd} onChange={(e) => setBackupPwd(e.target.value)} style={{ fontFamily: "monospace", padding: "4px", marginRight: "6px" }} />
+            <button onClick={downloadBackup} style={btnStyle}>Download encrypted backup</button>
+          </div>
+        )}
       </section>
 
       {/* Step 3 */}
       <section style={sectionStyle}>
         <h2>{icon(statuses["s3"])} Step 3: Rotate Passkey (simulate lost device)</h2>
-        <p>Creates Passkey B, signs a recovery digest with the recovery key, and relays the rotation.</p>
-        <div style={{ margin: "8px 0" }}>
-          <label style={{ fontSize: "13px" }}>Recovery private key (from Step 2):</label>
+        <p>Obtains the recovery key (backup or pasted), checks it against the one registered on-chain, creates Passkey B, signs the recovery digest and relays the rotation.</p>
+        <div style={{ margin: "8px 0", fontSize: "13px" }}>
+          <label><input type="radio" checked={restoreSource === "backup"} onChange={() => setRestoreSource("backup")} disabled={state.rotationDone} /> Encrypted backup file + password</label>
           <br />
-          <input
-            type="text"
-            placeholder="0x..."
-            value={recoveryKeyInput}
-            onChange={(e) => setRecoveryKeyInput(e.target.value)}
-            style={{ width: "100%", fontFamily: "monospace", fontSize: "12px", padding: "4px", marginTop: "4px" }}
-          />
+          <label><input type="radio" checked={restoreSource === "paste"} onChange={() => setRestoreSource("paste")} disabled={state.rotationDone} /> Paste the private key</label>
         </div>
+        {restoreSource === "backup" ? (
+          <div style={{ margin: "8px 0", fontSize: "13px" }}>
+            <input type="file" accept="application/json" onChange={async (e) => setImportFileText((await e.target.files?.[0]?.text()) ?? "")} />
+            <br />
+            <input type="password" placeholder="backup password" value={importPwd} onChange={(e) => setImportPwd(e.target.value)} style={{ fontFamily: "monospace", padding: "4px", marginTop: "6px" }} />
+          </div>
+        ) : (
+          <div style={{ margin: "8px 0" }}>
+            <label style={{ fontSize: "13px" }}>Recovery private key (from Step 2):</label>
+            <br />
+            <input
+              type="text"
+              placeholder="0x..."
+              value={recoveryKeyInput}
+              onChange={(e) => setRecoveryKeyInput(e.target.value)}
+              style={{ width: "100%", fontFamily: "monospace", fontSize: "12px", padding: "4px", marginTop: "4px" }}
+            />
+          </div>
+        )}
         {state.passkeyB && <p>Passkey B created ✓ x={state.passkeyB.x.slice(0, 16)}...</p>}
         {state.rotationDone && <p style={okStyle}>Rotation complete ✓</p>}
         <button onClick={step3} disabled={!state.recoverySetup || statuses["s3"] === "loading" || state.rotationDone} style={btnStyle}>
