@@ -84,6 +84,10 @@ Then follow steps 1 to 6 in the page. Copy the recovery private key shown in ste
 - **Validation gas varies per signature.** The bundler estimates `verificationGasLimit` with a short dummy WebAuthn signature. Browsers may add an extra key to `clientDataJSON` (`"other_keys_can_be_added_here"`), and the longer real signature can exceed the estimate. The bundler then answers with a generic "Internal error". `src/lib/wallet.ts` adds a margin before the paymaster signs the gas limits.
 - **Rotated Safes are loaded by address.** After a rotation, the counterfactual address computed from passkey B is a different Safe. The original one must be loaded with `loadExistingSafe(passkeyB, address)`.
 
+## Formal verification
+
+[`formal/`](formal/) holds a Lean 4 model of `RecoveryAuthorityModule` with machine-checked proofs: the passkey only changes through an `execute` of a rotation signed by the current recovery authority, after the delay and without cancellation; authority signatures are single-use; at most one rotation is pending; an elapsed rotation can always be executed; and, for a passkey authority, a WebAuthn assertion is bound to exactly one rotation digest (base64url proven injective). See [`formal/README.md`](formal/README.md) for the theorems and their assumptions.
+
 ## Roadmap
 
 | Phase | Goal |
