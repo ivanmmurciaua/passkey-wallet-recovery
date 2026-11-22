@@ -3,13 +3,14 @@
 // a version or an RPC URL: import it from here. `npm run check:constants` compares this
 // file with the official Safe deployment registries and fails loudly on any mismatch.
 import { Address, Chain, toHex } from "viem";
-import { arbitrumSepolia, baseSepolia, sepolia } from "viem/chains";
+import { sepolia } from "viem/chains";
 
 // ── Versions ────────────────────────────────────────────────────────────────────────────
 
 export const VERSIONS = {
-  /** Safe singleton (SafeL2) + proxy factory + fallback handler. */
-  safe: "1.4.1",
+  /** Safe singleton (SafeL2) + proxy factory + fallback handler. 1.5.0 adds the module guard
+   *  (IModuleGuard.checkModuleTransaction), which sees UserOps executed by Safe4337Module. */
+  safe: "1.5.0",
   /** Safe4337Module + SafeModuleSetup (safe-modules-deployments "safe-4337-module"). */
   safe4337Module: "0.3.0",
   /** SafeWebAuthnSharedSigner + SignerFactory + Daimo verifier ("safe-passkey-module"). */
@@ -45,19 +46,23 @@ export const PACKED_VERIFIERS_HEX = toHex(PACKED_VERIFIERS);
 
 // ── Networks ────────────────────────────────────────────────────────────────────────────
 
-export type NetworkKey = "sepolia" | "baseSepolia" | "arbitrumSepolia";
+// The PoC targets Ethereum Sepolia only. Add a network here (and run check:constants) to extend it.
+export type NetworkKey = "sepolia";
 
 export interface NetworkConfig {
   key: NetworkKey;
   chain: Chain;
   rpcUrl: string;
+  /** RPC with full log history for eth_getLogs (many public RPCs prune old logs or cap ranges). */
+  logsRpcUrl: string;
   /** Slug used in Pimlico's v2 URLs. */
   pimlicoSlug: string;
   explorerUrl: string;
   /** Which P-256 precompile spec the network implements (gas differs). */
   p256Precompile: "EIP-7951" | "RIP-7212";
-  /** Our RecoveryModule on this network, if deployed. */
+  /** Our RecoveryModule on this network, if deployed, and the block to start log searches from. */
   recoveryModule?: Address;
+  recoveryModuleFromBlock?: bigint;
 }
 
 export const NETWORKS: Record<NetworkKey, NetworkConfig> = {
@@ -65,30 +70,16 @@ export const NETWORKS: Record<NetworkKey, NetworkConfig> = {
     key: "sepolia",
     chain: sepolia,
     rpcUrl: "https://ethereum-sepolia-rpc.publicnode.com",
+    logsRpcUrl: "https://sepolia.gateway.tenderly.co",
     pimlicoSlug: "sepolia",
     explorerUrl: "https://sepolia.etherscan.io",
     p256Precompile: "EIP-7951",
     recoveryModule: "0x0cc7d46dd3247aa14099bf4baf16d1798d7a12d3",
-  },
-  baseSepolia: {
-    key: "baseSepolia",
-    chain: baseSepolia,
-    rpcUrl: "https://sepolia.base.org",
-    pimlicoSlug: "base-sepolia",
-    explorerUrl: "https://sepolia.basescan.org",
-    p256Precompile: "RIP-7212",
-  },
-  arbitrumSepolia: {
-    key: "arbitrumSepolia",
-    chain: arbitrumSepolia,
-    rpcUrl: "https://sepolia-rollup.arbitrum.io/rpc",
-    pimlicoSlug: "arbitrum-sepolia",
-    explorerUrl: "https://sepolia.arbiscan.io",
-    p256Precompile: "RIP-7212",
+    recoveryModuleFromBlock: 10_863_000n, // first RecoverySetup event at 10,863,681
   },
 };
 
-/** Active network: NEXT_PUBLIC_NETWORK (sepolia | baseSepolia | arbitrumSepolia), default sepolia. */
+/** Active network: NEXT_PUBLIC_NETWORK (only "sepolia" today), default sepolia. */
 export const NETWORK: NetworkConfig =
   NETWORKS[(process.env.NEXT_PUBLIC_NETWORK as NetworkKey) ?? "sepolia"] ?? NETWORKS.sepolia;
 

@@ -14,7 +14,7 @@ What can be recovered is the **account**, not the credential: the wallet rotates
 
 ## What is proven today (phase F1)
 
-Validated end to end on **Sepolia** on 2026-11-15:
+Validated end to end on **Sepolia** on 2026-11-15 (Safe 1.4.1) and again on 2026-11-22 on **Safe 1.5.0** ([tx](https://sepolia.etherscan.io/tx/0x1dea46b53eba9454d0bedbfb9abadb2d2d0ea876b1b3e26716b735ac45bfd1af)):
 
 1. Passkey A creates and deploys a Safe whose owner is the `SafeWebAuthnSharedSigner`, and enables a `RecoveryModule`.
 2. A recovery key is registered in the module for that Safe.
@@ -23,12 +23,14 @@ Validated end to end on **Sepolia** on 2026-11-15:
 5. Passkey B loads the **original** Safe (same address).
 6. Passkey B signs a real UserOperation on that Safe, sponsored by a paymaster ([tx](https://sepolia.etherscan.io/tx/0x9ddf9839b7fd7b57500a032eed4cd12aa48994c629304a6fd3a85abe9ca8a98b)).
 
+Recovery works from a fresh session: with only the encrypted backup of the recovery key and its password, step 3 finds the Safe on its own from the module's `RecoverySetup(safe, recoveryKey)` events and rotates it. The address of the Safe does not need to be remembered.
+
 Signature verification goes through the **P256VERIFY precompile** (`0x0100`), with the Solidity Daimo verifier only as a fallback. This was checked by removing the fallback with a state override: validation still passes with the same gas.
 
 ## Architecture
 
 ```
-Safe (v1.4.1, ERC-4337 via Safe4337Module v0.3.0, EntryPoint v0.7)
+Safe (v1.5.0, ERC-4337 via Safe4337Module v0.3.0, EntryPoint v0.7)
  └─ owner: SafeWebAuthnSharedSigner (singleton)
       └─ stores (x, y, verifiers) in the Safe's own storage
            verifiers = (0x0100 << 160) | DaimoP256Verifier   (precompile first, Solidity fallback)
@@ -44,11 +46,11 @@ RecoveryModule (enabled on the Safe)
 
 ## Versions and addresses
 
-Everything lives in one file, [`src/app/constants.ts`](src/app/constants.ts): versions, canonical addresses and the network registry (Sepolia, Base Sepolia, Arbitrum Sepolia). The app, the scripts and the Hardhat config import from it; nothing else hardcodes an address or an RPC URL.
+Everything lives in one file, [`src/app/constants.ts`](src/app/constants.ts): versions, canonical addresses and the network registry (Ethereum Sepolia only, for now). The app, the scripts and the Hardhat config import from it; nothing else hardcodes an address or an RPC URL.
 
 | Component | Version |
 |---|---|
-| Safe | 1.4.1 (1.5.0 is not deployed on Arbitrum Sepolia per the official registry) |
+| Safe | 1.5.0 (adds the module guard needed to enforce a policy on UserOps) |
 | Safe4337Module / SafeModuleSetup | 0.3.0 |
 | Safe passkey module (SharedSigner, SignerFactory, Daimo verifier) | 0.2.1 |
 | EntryPoint | 0.7 |
@@ -86,7 +88,7 @@ Then follow steps 1 to 6 in the page. Copy the recovery private key shown in ste
 
 | Phase | Goal |
 |---|---|
-| F1 | Passkey rotation on a Safe, up to date, on Sepolia (done) and L2 testnets |
+| F1 | Passkey rotation on a Safe, up to date, on Sepolia (done), plus an encrypted backup of the recovery key (done) |
 | F2 | Recovery module with a pluggable recovery authority (EOA, second passkey, M-of-N guardians), a timelock and cancellation by the current signer |
 | F3 | Assets and multichain: same address on several networks, module in the initial setup, rotation per network |
 | F4 | Post-quantum recovery authority (hash-based and lattice verifiers) on any EVM chain |
