@@ -35,7 +35,7 @@ interface ISharedSigner {
  *  3. When rotating: recoveryKey signs an EIP-712 digest off-chain
  *     → anyone relays recover(safe, newX, newY, verifiers, sig)
  *     → this module calls SharedSigner.configure on behalf of the Safe
- * @dev: not audited
+ * @dev Not audited.
  */
 contract RecoveryModule {
     // SafeWebAuthnSharedSigner on Sepolia
