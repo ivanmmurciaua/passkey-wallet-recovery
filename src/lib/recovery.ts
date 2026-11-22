@@ -1,6 +1,6 @@
-import { createPublicClient, http, encodeFunctionData, parseAbi } from "viem";
+import { createPublicClient, http, encodeFunctionData, parseAbi, parseAbiItem } from "viem";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
-import { CHAIN, CHAIN_ID, PACKED_VERIFIERS, RECOVERY_MODULE_ADDRESS, RPC_URL, SHARED_SIGNER_ADDRESS } from "@/app/constants";
+import { CHAIN, CHAIN_ID, NETWORK, PACKED_VERIFIERS, RECOVERY_MODULE_ADDRESS, RPC_URL, SHARED_SIGNER_ADDRESS } from "@/app/constants";
 import { SignerConfig } from "@/types";
 
 export const publicClient = createPublicClient({ chain: CHAIN, transport: http(RPC_URL) });
@@ -142,4 +142,29 @@ export function encodeRecover(params: {
 // P256.sol tries the precompile first (6.9k gas), falls back to Daimo if empty
 export function defaultVerifiers(): bigint {
   return PACKED_VERIFIERS;
+}
+
+const recoverySetupEvent = parseAbiItem("event RecoverySetup(address indexed safe, address indexed recoveryKey)");
+
+// Log queries go to an RPC with full history (the default public RPC prunes old logs).
+const logsClient = createPublicClient({ chain: CHAIN, transport: http(NETWORK.logsRpcUrl) });
+
+/**
+ * Find the Safes whose CURRENT recovery key is `recoveryKey`, from the module's RecoverySetup
+ * events, so a user holding only the backup file can recover without remembering the Safe address.
+ */
+export async function findSafesByRecoveryKey(recoveryKey: string): Promise<string[]> {
+  const logs = await logsClient.getLogs({
+    address: RECOVERY_MODULE_ADDRESS,
+    event: recoverySetupEvent,
+    args: { recoveryKey: recoveryKey as `0x${string}` },
+    fromBlock: NETWORK.recoveryModuleFromBlock ?? 0n,
+    toBlock: "latest",
+  });
+  const candidates = [...new Set(logs.map((l) => l.args.safe).filter((a): a is `0x${string}` => !!a))];
+  const current: string[] = [];
+  for (const safe of candidates) {
+    if ((await getRecoveryKey(safe)).toLowerCase() === recoveryKey.toLowerCase()) current.push(safe);
+  }
+  return current;
 }

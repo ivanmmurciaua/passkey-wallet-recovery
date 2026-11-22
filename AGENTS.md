@@ -21,7 +21,7 @@ This version has breaking changes: APIs, conventions, and file structure may all
 2. **Fail loudly.** After changing constants, run `npm run check:constants`. It compares them with the official Safe registries, checks code on-chain and exercises the P256VERIFY precompile. A check that cannot run must report the failure, never a silent pass.
 3. **Secrets stay local.** `.env.local` holds API keys and, optionally, a deployer key. It is git-ignored; never print, copy or commit its values. `.env.local.example` documents the variables with placeholders only.
 4. **Verify with a production build.** Use `npm run build && npm run start`, not the dev server, before reporting a change as working.
-5. **Testnets only.** Sepolia, Base Sepolia and Arbitrum Sepolia, as listed in `constants.ts`.
+5. **Testnet only.** Ethereum Sepolia, as listed in `constants.ts`.
 6. **Writing style.** Code, comments and docs in English. Do not use the em-dash character; use a comma, a colon or parentheses. No absolute local paths in committed files.
 7. **Git.** Do not commit, push, create branches or open pull requests unless the maintainer asks for it explicitly. Propose a commit message instead.
 

@@ -3,7 +3,7 @@
 import { useState } from "react";
 import { PocState, StepStatus } from "@/types";
 import { createPasskey, toPasskeyArg } from "@/lib/passkeys";
-import { toHex } from "viem";
+import { isAddress, toHex } from "viem";
 import { initSafe, loadExistingSafe, sendUserOp } from "@/lib/wallet";
 import {
   encodeEnableModule,
@@ -12,6 +12,7 @@ import {
   generateRecoveryKey,
   getRecoveryNonce,
   getRecoveryKey,
+  findSafesByRecoveryKey,
   getSharedSignerConfig,
   isModuleEnabled,
   signRecovery,
@@ -76,6 +77,10 @@ export default function PocPage() {
   const [backupPwd, setBackupPwd] = useState("");
   const [importFileText, setImportFileText] = useState("");
   const [importPwd, setImportPwd] = useState("");
+  // Step 3 must work from a fresh session (the real "lost device" case): the Safe address can be
+  // typed in, and everything else is read from the chain, not from steps 1-2 of this session.
+  const [s3SafeAddress, setS3SafeAddress] = useState("");
+  const recoverSafe = (s3SafeAddress.trim() || state.safeAddress).trim();
 
   // Import fields for existing credentials (Step 1 Option A)
   const [importSafeAddress, setImportSafeAddress] = useState("");
@@ -267,7 +272,8 @@ export default function PocPage() {
   async function step3() {
     setStatus("s3", "loading");
     try {
-      if (!state.safeAddress) throw new Error("Complete Step 1 first");
+      let safe = recoverSafe;
+      if (safe && !isAddress(safe)) throw new Error("The Safe address is not valid");
       if (restoreSource === "backup" && (!importFileText || !importPwd)) throw new Error("Load the backup file and enter its password");
       if (restoreSource === "paste") toRecoveryKey(recoveryKeyInput); // fail fast, before creating Passkey B
 
@@ -282,7 +288,17 @@ export default function PocPage() {
         K = recoveryKeyInput;
       }
       const recovery = toRecoveryKey(K);
-      const registered = await getRecoveryKey(state.safeAddress);
+      if (!safe) {
+        // No address given: find the Safe from the recovery key itself (RecoverySetup events).
+        log(`Looking up the Safe whose recovery key is ${recovery.address}...`);
+        const safes = await findSafesByRecoveryKey(recovery.address);
+        if (safes.length === 0) throw new Error("No Safe currently has this recovery key registered. Enter the Safe address.");
+        if (safes.length > 1) throw new Error(`This recovery key protects several Safes: ${safes.join(", ")}. Enter the one to recover.`);
+        safe = safes[0];
+        log(`Found Safe: ${safe}`);
+      }
+      const registered = await getRecoveryKey(safe);
+      if (/^0x0{40}$/i.test(registered)) throw new Error(`No recovery key is registered for ${safe}`);
       if (recovery.address.toLowerCase() !== registered.toLowerCase()) {
         throw new Error(`This recovery key is ${recovery.address}, but the Safe has ${registered} registered`);
       }
@@ -296,7 +312,7 @@ export default function PocPage() {
       setState((s) => ({ ...s, passkeyB: coords }));
 
       log("Reading SharedSigner config BEFORE rotation...");
-      const currentConfig = await getSharedSignerConfig(state.safeAddress);
+      const currentConfig = await getSharedSignerConfig(safe);
       log(`Current X (Passkey A): ${currentConfig.x.toString()}`);
       log(`Current Y (Passkey A): ${currentConfig.y.toString()}`);
       log(`Current verifiers: ${currentConfig.verifiers.toString()}`);
@@ -307,13 +323,13 @@ export default function PocPage() {
       log(`Verifiers for Passkey B: ${verifiers.toString()} (precompile 0x0100 + Daimo fallback; same as the deploy)`);
 
       log("Reading nonce from RecoveryModule...");
-      const nonce = await getRecoveryNonce(state.safeAddress);
+      const nonce = await getRecoveryNonce(safe);
       log(`Nonce: ${nonce}`);
 
       log("Signing EIP-712 recovery digest with recovery key...");
       const signature = await signRecovery({
         privateKey: recovery.privateKey,
-        safeAddress: state.safeAddress,
+        safeAddress: safe,
         newX: BigInt(coords.x),
         newY: BigInt(coords.y),
         verifiers,
@@ -332,7 +348,7 @@ export default function PocPage() {
         {
           to: RECOVERY_MODULE_ADDRESS,
           data: encodeRecover({
-            safeAddress: state.safeAddress,
+            safeAddress: safe,
             newX: BigInt(coords.x),
             newY: BigInt(coords.y),
             verifiers,
@@ -342,7 +358,7 @@ export default function PocPage() {
         },
       ]);
       log(`UserOp hash: ${userOpHash}`);
-      setState((s) => ({ ...s, rotationDone: true }));
+      setState((s) => ({ ...s, safeAddress: safe, rotationDone: true }));
       setStatus("s3", "done");
     } catch (e: unknown) {
       log(e instanceof Error ? e.message : String(e), true);
@@ -585,7 +601,19 @@ export default function PocPage() {
       {/* Step 3 */}
       <section style={sectionStyle}>
         <h2>{icon(statuses["s3"])} Step 3: Rotate Passkey (simulate lost device)</h2>
-        <p>Obtains the recovery key (backup or pasted), checks it against the one registered on-chain, creates Passkey B, signs the recovery digest and relays the rotation.</p>
+        <p>Obtains the recovery key (backup or pasted), checks it against the one registered on-chain, creates Passkey B, signs the recovery digest and relays the rotation. Works in a fresh session: the recovery key alone is enough, the Safe is found from its on-chain RecoverySetup event.</p>
+        <div style={{ margin: "8px 0" }}>
+          <label style={{ fontSize: "13px" }}>Safe to recover (optional):</label>
+          <br />
+          <input
+            type="text"
+            placeholder={state.safeAddress || "0x... (optional: found from the recovery key if empty)"}
+            value={s3SafeAddress}
+            onChange={(e) => setS3SafeAddress(e.target.value)}
+            disabled={state.rotationDone}
+            style={{ width: "100%", fontFamily: "monospace", fontSize: "12px", padding: "4px", marginTop: "4px" }}
+          />
+        </div>
         <div style={{ margin: "8px 0", fontSize: "13px" }}>
           <label><input type="radio" checked={restoreSource === "backup"} onChange={() => setRestoreSource("backup")} disabled={state.rotationDone} /> Encrypted backup file + password</label>
           <br />
@@ -612,7 +640,7 @@ export default function PocPage() {
         )}
         {state.passkeyB && <p>Passkey B created ✓ x={state.passkeyB.x.slice(0, 16)}...</p>}
         {state.rotationDone && <p style={okStyle}>Rotation complete ✓</p>}
-        <button onClick={step3} disabled={!state.recoverySetup || statuses["s3"] === "loading" || state.rotationDone} style={btnStyle}>
+        <button onClick={step3} disabled={(recoverSafe !== "" && !isAddress(recoverSafe)) || statuses["s3"] === "loading" || state.rotationDone} style={btnStyle}>
           {statuses["s3"] === "loading" ? "Working..." : "Rotate Passkey"}
         </button>
       </section>
