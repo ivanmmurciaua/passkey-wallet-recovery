@@ -21,6 +21,7 @@ the main theorems use: only Lean's standard axioms (`propext`, `Quot.sound` and,
 | `RecoveryModel/Theorems.lean` | The theorems below |
 | `RecoveryModel/WebAuthn.lean` | Model of OpenZeppelin's `WebAuthn.verify` (behind `ERC7913WebAuthnVerifier`), base64url encoder and decoder, and T6 |
 | `RecoveryModel/Examples.lean` | Executable scenarios mirroring `test/RecoveryAuthorityModule.ts`, and base64url test vectors checked against Node |
+| `RecoveryModel/SepoliaTraces.lean` | The end-to-end runs of the UI on Sepolia (both authority kinds), replayed from the module events: the model accepts exactly the calls that succeeded on-chain, refuses the ones the page blocked, and ends in the same nonce, pending rotation and passkey config |
 
 ## Theorems
 
