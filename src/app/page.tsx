@@ -2,23 +2,30 @@
 
 import { useState } from "react";
 import { PocState, StepStatus } from "@/types";
-import { createPasskey, toPasskeyArg } from "@/lib/passkeys";
+import { createPasskey, signDigestWithPasskey, toPasskeyArg } from "@/lib/passkeys";
 import { isAddress, toHex } from "viem";
-import { initSafe, loadExistingSafe, sendUserOp } from "@/lib/wallet";
+import { initSafe, loadExistingSafe, loadJustDeployedSafe, sendUserOp } from "@/lib/wallet";
 import {
+  chainTime,
+  defaultVerifiers,
+  describeSigner,
+  encodeCancel,
   encodeEnableModule,
+  encodeExecute,
+  encodeRequest,
   encodeSetupRecovery,
-  encodeRecover,
+  findSafesBySigner,
   generateRecoveryKey,
-  getRecoveryNonce,
-  getRecoveryKey,
-  findSafesByRecoveryKey,
+  getPending,
+  getRecovery,
+  getRotateDigest,
   getSharedSignerConfig,
   isModuleEnabled,
-  signRecovery,
-  defaultVerifiers,
+  signDigestWithKey,
+  signerForAddress,
+  signerForPasskey,
 } from "@/lib/recovery";
-import { RECOVERY_MODULE_ADDRESS } from "@/app/constants";
+import { DEFAULT_RECOVERY_DELAY_SECONDS, RECOVERY_MODULE_ADDRESS } from "@/app/constants";
 import { exportKRecovery, importKRecovery } from "@/lib/keybackup";
 import { privateKeyToAccount } from "viem/accounts";
 import { PasskeyArgType } from "@safe-global/protocol-kit";
@@ -28,10 +35,14 @@ const empty: PocState = {
   safeAddress: "",
   passkeyA: null,
   moduleEnabled: false,
+  recoveryKind: null,
   recoveryAddress: "",
   recoveryPrivateKey: "",
+  recoveryPasskey: null,
   recoverySetup: false,
   passkeyB: null,
+  requestDone: false,
+  executeAfter: "",
   rotationDone: false,
   verifiedConfig: null,
   verificationPassed: null,
@@ -54,8 +65,11 @@ function downloadJson(filename: string, text: string) {
   URL.revokeObjectURL(url);
 }
 
-// Where step 3 obtains the recovery key again.
-type RestoreSource = "backup" | "paste";
+// Recovery authority chosen in step 2. Always the user's own; third-party guardians are optional
+// and not implemented yet.
+type AuthorityChoice = "key" | "passkey";
+// Where step 3 obtains the authority again.
+type RestoreSource = "backup" | "paste" | "passkey";
 
 /** Validate a 0x + 64-hex secp256k1 private key and return it with its address. */
 function toRecoveryKey(k: string): { privateKey: `0x${string}`; address: `0x${string}` } {
@@ -68,6 +82,10 @@ function toRecoveryKey(k: string): { privateKey: `0x${string}`; address: `0x${st
 export default function PocPage() {
   const [state, setState] = useState<PocState>(empty);
   const [packA, setPackA] = useState<Safe4337Pack | null>(null);
+  // Safe of Passkey B: relays request() and execute() (anyone may relay them).
+  const [packB, setPackB] = useState<Safe4337Pack | null>(null);
+  const [authorityChoice, setAuthorityChoice] = useState<AuthorityChoice>("key");
+  const [delayInput, setDelayInput] = useState(DEFAULT_RECOVERY_DELAY_SECONDS.toString());
   const [logs, setLogs] = useState<Log[]>([]);
   const [statuses, setStatuses] = useState<Record<string, StepStatus>>({});
   const [recoveryKeyInput, setRecoveryKeyInput] = useState("");
@@ -136,7 +154,7 @@ export default function PocPage() {
 
       if (!moduleEnabled) {
         if (!RECOVERY_MODULE_ADDRESS) {
-          throw new Error("NEXT_PUBLIC_RECOVERY_MODULE_ADDRESS not set");
+          throw new Error("No recovery module registered for this network in constants.ts");
         }
         log("Enabling RecoveryModule via UserOp (also deploys Safe if not yet deployed)...");
         const hash = await sendUserOp(pack, [
@@ -183,7 +201,7 @@ export default function PocPage() {
       setState((s) => ({ ...s, safeAddress, passkeyA: coords }));
 
       if (!RECOVERY_MODULE_ADDRESS) {
-        throw new Error("NEXT_PUBLIC_RECOVERY_MODULE_ADDRESS not set: run the deploy script first");
+        throw new Error("No recovery module registered for this network in constants.ts: deploy it first (scripts/deploy-f2b.ts)");
       }
 
       log("Sending UserOp: enableModule(RecoveryModule)...");
@@ -210,42 +228,42 @@ export default function PocPage() {
     }
   }
 
-  // ── Step 2: Setup Recovery Key ───────────────────────────────────────────
+  // ── Step 2: Setup the recovery authority ─────────────────────────────────
 
   async function step2() {
     setStatus("s2", "loading");
     try {
       if (!packA || !state.safeAddress) throw new Error("Complete Step 1 first");
+      const delay = BigInt(delayInput.trim() || "0");
 
-      log("Generating recovery key...");
-      const { privateKey, address } = generateRecoveryKey();
-      log(`Recovery address: ${address}`);
-      setState((s) => ({ ...s, recoveryAddress: address, recoveryPrivateKey: privateKey }));
+      let signer: `0x${string}`;
+      if (authorityChoice === "key") {
+        log("Generating a recovery key (keep it in the encrypted backup below)...");
+        const { privateKey, address } = generateRecoveryKey();
+        signer = signerForAddress(address);
+        log(`Recovery authority: key ${address}`);
+        setState((s) => ({ ...s, recoveryKind: "key", recoveryAddress: address, recoveryPrivateKey: privateKey, recoveryPasskey: null }));
+      } else {
+        log("Creating the recovery passkey (discoverable, user verification required)...");
+        const { coords } = await createPasskey("recovery", true);
+        signer = signerForPasskey(coords.x, coords.y);
+        log(`Recovery authority: passkey x=${coords.x} y=${coords.y}`);
+        setState((s) => ({ ...s, recoveryKind: "passkey", recoveryAddress: "", recoveryPrivateKey: "", recoveryPasskey: coords }));
+      }
 
-      log("Sending UserOp: setupRecovery(recoveryKey)...");
-      const hash = await sendUserOp(packA, [
-        {
-          to: RECOVERY_MODULE_ADDRESS,
-          data: encodeSetupRecovery(address),
-          value: "0",
-        },
-      ]);
+      log(`Sending UserOp: setupRecovery(signer, delay = ${delay}s)...`);
+      const hash = await sendUserOp(packA, [{ to: RECOVERY_MODULE_ADDRESS, data: encodeSetupRecovery(signer, delay), value: "0" }]);
       log(`UserOp hash: ${hash}`);
 
-      // The public RPC is load-balanced: a node behind the one that served the receipt can still
-      // return the old value (seen on Sepolia: 0x0 right after a successful setupRecovery).
-      // Re-read for a few seconds before concluding there is a mismatch.
-      log("Verifying on-chain: recoveryKeys[safe]...");
-      let storedKey = await getRecoveryKey(state.safeAddress);
-      for (let i = 0; i < 10 && storedKey.toLowerCase() !== address.toLowerCase(); i++) {
+      // The public RPC is load-balanced: re-read for a few seconds before concluding a mismatch.
+      log("Verifying on-chain: recoverySigner[safe]...");
+      let stored = (await getRecovery(state.safeAddress)).signer;
+      for (let i = 0; i < 10 && stored.toLowerCase() !== signer.toLowerCase(); i++) {
         await new Promise((r) => setTimeout(r, 1500));
-        storedKey = await getRecoveryKey(state.safeAddress);
+        stored = (await getRecovery(state.safeAddress)).signer;
       }
-      log(`Stored recovery key: ${storedKey}`);
-      if (storedKey.toLowerCase() !== address.toLowerCase()) {
-        throw new Error(`On-chain key mismatch: expected ${address}, got ${storedKey}`);
-      }
-      log("On-chain recovery key verified ✓");
+      if (stored.toLowerCase() !== signer.toLowerCase()) throw new Error(`On-chain signer mismatch: got ${stored}`);
+      log("On-chain recovery authority verified ✓");
       setState((s) => ({ ...s, recoverySetup: true }));
       setStatus("s2", "done");
     } catch (e: unknown) {
@@ -267,102 +285,132 @@ export default function PocPage() {
     }
   }
 
-  // ── Step 3: Rotate Passkey ───────────────────────────────────────────────
+  // ── Step 3: Request the rotation (authority signs, anyone relays) ─────────
 
   async function step3() {
     setStatus("s3", "loading");
     try {
       let safe = recoverSafe;
       if (safe && !isAddress(safe)) throw new Error("The Safe address is not valid");
-      if (restoreSource === "backup" && (!importFileText || !importPwd)) throw new Error("Load the backup file and enter its password");
-      if (restoreSource === "paste") toRecoveryKey(recoveryKeyInput); // fail fast, before creating Passkey B
 
-      // Obtain the recovery key and check it against the one registered on-chain BEFORE creating
-      // Passkey B or signing anything: a wrong password or another Safe's backup stops here.
-      let K: string;
-      if (restoreSource === "backup") {
-        log("Decrypting the backup file with its password...");
-        K = await importKRecovery(importFileText, importPwd);
-        log("Recovery key recovered from the encrypted backup.");
+      // 1. Obtain the authority and, if needed, find the Safe from it.
+      let keyAuthority: { privateKey: `0x${string}`; address: `0x${string}` } | null = null;
+      if (restoreSource === "passkey") {
+        if (!safe) throw new Error("Enter the Safe to recover (a passkey authority cannot be looked up before signing)");
       } else {
-        K = recoveryKeyInput;
+        if (restoreSource === "backup" && (!importFileText || !importPwd)) throw new Error("Load the backup file and enter its password");
+        const K = restoreSource === "backup" ? await importKRecovery(importFileText, importPwd) : recoveryKeyInput;
+        keyAuthority = toRecoveryKey(K);
+        if (restoreSource === "backup") log("Recovery key recovered from the encrypted backup.");
+        if (!safe) {
+          log(`Looking up the Safe whose recovery authority is ${keyAuthority.address}...`);
+          const safes = await findSafesBySigner(signerForAddress(keyAuthority.address));
+          if (safes.length === 0) throw new Error("No Safe currently has this recovery key registered. Enter the Safe address.");
+          if (safes.length > 1) throw new Error(`This key protects several Safes: ${safes.join(", ")}. Enter the one to recover.`);
+          safe = safes[0];
+          log(`Found Safe: ${safe}`);
+        }
       }
-      const recovery = toRecoveryKey(K);
-      if (!safe) {
-        // No address given: find the Safe from the recovery key itself (RecoverySetup events).
-        log(`Looking up the Safe whose recovery key is ${recovery.address}...`);
-        const safes = await findSafesByRecoveryKey(recovery.address);
-        if (safes.length === 0) throw new Error("No Safe currently has this recovery key registered. Enter the Safe address.");
-        if (safes.length > 1) throw new Error(`This recovery key protects several Safes: ${safes.join(", ")}. Enter the one to recover.`);
-        safe = safes[0];
-        log(`Found Safe: ${safe}`);
-      }
-      const registered = await getRecoveryKey(safe);
-      if (/^0x0{40}$/i.test(registered)) throw new Error(`No recovery key is registered for ${safe}`);
-      if (recovery.address.toLowerCase() !== registered.toLowerCase()) {
-        throw new Error(`This recovery key is ${recovery.address}, but the Safe has ${registered} registered`);
-      }
-      log(`Recovery key matches the one registered on-chain (${registered}) ✓`);
 
+      // 2. Check the authority against the one registered on-chain, before creating anything.
+      const { signer: registered, delay } = await getRecovery(safe);
+      if (registered === "0x") throw new Error(`No recovery authority is registered for ${safe}`);
+      const kind = describeSigner(registered);
+      if (keyAuthority) {
+        if (kind.kind !== "address" || kind.address.toLowerCase() !== keyAuthority.address.toLowerCase()) {
+          throw new Error(`This recovery key is ${keyAuthority.address}, but the Safe's authority is ${registered}`);
+        }
+      } else if (kind.kind !== "passkey") {
+        throw new Error("The Safe's recovery authority is not a passkey");
+      }
+      log(`Recovery authority matches the one registered on-chain (${kind.kind}) ✓ · delay ${delay}s`);
+      if (await getPending(safe)) throw new Error("A rotation is already pending for this Safe: execute or cancel it first");
+
+      // 3. Passkey B, and the digest the authority signs (binds safe, new passkey, nonce, chain, module).
       log("Creating Passkey B (new passkey)...");
       const { coords } = await createPasskey("passkey-B");
       log(`Passkey B rawId: ${coords.rawId}`);
       log(`Passkey B X: ${coords.x}`);
       log(`Passkey B Y: ${coords.y}`);
       setState((s) => ({ ...s, passkeyB: coords }));
-
-      log("Reading SharedSigner config BEFORE rotation...");
-      const currentConfig = await getSharedSignerConfig(safe);
-      log(`Current X (Passkey A): ${currentConfig.x.toString()}`);
-      log(`Current Y (Passkey A): ${currentConfig.y.toString()}`);
-      log(`Current verifiers: ${currentConfig.verifiers.toString()}`);
-
-      // Always upgrade to PACKED_VERIFIERS (precompile 0x0100 + Daimo fallback).
-      // This migrates the Safe to the EIP-7951 precompile regardless of what it had before.
       const verifiers = defaultVerifiers();
-      log(`Verifiers for Passkey B: ${verifiers.toString()} (precompile 0x0100 + Daimo fallback; same as the deploy)`);
+      const digest = await getRotateDigest(safe, BigInt(coords.x), BigInt(coords.y), verifiers);
+      log(`Rotate digest (EIP-712): ${digest}`);
 
-      log("Reading nonce from RecoveryModule...");
-      const nonce = await getRecoveryNonce(safe);
-      log(`Nonce: ${nonce}`);
+      let signature: `0x${string}`;
+      if (keyAuthority) {
+        signature = await signDigestWithKey(keyAuthority.privateKey, digest);
+        log("Signed with the recovery key.");
+      } else {
+        log("Sign with your recovery passkey (user verification required)...");
+        signature = (await signDigestWithPasskey(digest, state.recoveryPasskey?.rawId)).signature;
+        log("Signed with the recovery passkey (WebAuthn assertion over the digest).");
+      }
 
-      log("Signing EIP-712 recovery digest with recovery key...");
-      const signature = await signRecovery({
-        privateKey: recovery.privateKey,
-        safeAddress: safe,
-        newX: BigInt(coords.x),
-        newY: BigInt(coords.y),
-        verifiers,
-        nonce,
-      });
-      log(`Signature: ${signature}`);
-
-      log("Initializing Safe B (0x3) to send the UserOp...");
-      const passkeyB: PasskeyArgType = toPasskeyArg(coords.rawId, coords.x, coords.y);
-      const packB = await initSafe(passkeyB);
-      const addrB = await packB.protocolKit.getAddress();
-      log(`Safe B (0x3) address: ${addrB}`);
-
-      log("Sending UserOp from Safe B (0x3): recover(0x1, newX, newY, verifiers, sig): sponsored by Pimlico...");
-      const userOpHash = await sendUserOp(packB, [
-        {
-          to: RECOVERY_MODULE_ADDRESS,
-          data: encodeRecover({
-            safeAddress: safe,
-            newX: BigInt(coords.x),
-            newY: BigInt(coords.y),
-            verifiers,
-            signature,
-          }),
-          value: "0",
-        },
+      // 4. Relay request() from Passkey B's own Safe (sponsored).
+      log("Initializing Safe B to relay the request...");
+      const pack = await initSafe(toPasskeyArg(coords.rawId, coords.x, coords.y));
+      log(`Safe B address: ${await pack.protocolKit.getAddress()}`);
+      log("Sending UserOp from Safe B: request(safe, x, y, verifiers, sig)...");
+      const userOpHash = await sendUserOp(pack, [
+        { to: RECOVERY_MODULE_ADDRESS, data: encodeRequest(safe, BigInt(coords.x), BigInt(coords.y), verifiers, signature), value: "0" },
       ]);
       log(`UserOp hash: ${userOpHash}`);
-      setState((s) => ({ ...s, safeAddress: safe, rotationDone: true }));
+      let pending = await getPending(safe);
+      for (let i = 0; i < 10 && !pending; i++) {
+        await new Promise((r) => setTimeout(r, 1500));
+        pending = await getPending(safe);
+      }
+      if (!pending) throw new Error("The request is not visible on-chain yet; refresh in a moment");
+      log(`Rotation pending. Executable after ${new Date(Number(pending.executeAfter) * 1000).toISOString().slice(11, 19)} UTC (unix ${pending.executeAfter}).`);
+      // The request deployed Safe B. A pack built counterfactually keeps a passkey signer resolved
+      // before deployment (a per-passkey signer address, not the shared signer owner), so relay-kit
+      // rejects its next UserOp with "can only be signed by Safe owners". Reload it as a deployed Safe.
+      const safeB = await pack.protocolKit.getAddress();
+      setPackB(await loadJustDeployedSafe(toPasskeyArg(coords.rawId, coords.x, coords.y), safeB));
+      setState((s) => ({ ...s, safeAddress: safe, requestDone: true, executeAfter: pending.executeAfter.toString() }));
       setStatus("s3", "done");
     } catch (e: unknown) {
       log(e instanceof Error ? e.message : String(e), true);
       setStatus("s3", "error");
+    }
+  }
+
+  // ── Step 3b: Execute after the delay, or cancel with the current passkey ──
+
+  async function executeRotation() {
+    setStatus("s3b", "loading");
+    try {
+      if (!packB || !state.safeAddress) throw new Error("Request the rotation first (Step 3)");
+      const now = await chainTime();
+      if (state.executeAfter && now < BigInt(state.executeAfter)) {
+        throw new Error(`Too early: ${BigInt(state.executeAfter) - now}s left (the module would revert)`);
+      }
+      log("Sending UserOp from Safe B: execute(safe)...");
+      const userOpHash = await sendUserOp(packB, [{ to: RECOVERY_MODULE_ADDRESS, data: encodeExecute(state.safeAddress), value: "0" }]);
+      log(`UserOp hash: ${userOpHash}`);
+      log("Rotation executed: the Safe's passkey is now Passkey B ✓");
+      setState((s) => ({ ...s, rotationDone: true }));
+      setStatus("s3b", "done");
+    } catch (e: unknown) {
+      log(e instanceof Error ? e.message : String(e), true);
+      setStatus("s3b", "error");
+    }
+  }
+
+  async function cancelRotation() {
+    setStatus("s3b", "loading");
+    try {
+      if (!packA || !state.safeAddress) throw new Error("Cancelling needs the CURRENT passkey (Passkey A) loaded in Step 1");
+      log("Sending UserOp from the Safe (Passkey A): cancel()...");
+      const userOpHash = await sendUserOp(packA, [{ to: RECOVERY_MODULE_ADDRESS, data: encodeCancel(), value: "0" }]);
+      log(`UserOp hash: ${userOpHash}`);
+      log("Pending rotation cancelled ✓");
+      setState((s) => ({ ...s, requestDone: false, executeAfter: "" }));
+      setStatus("s3b", "done");
+    } catch (e: unknown) {
+      log(e instanceof Error ? e.message : String(e), true);
+      setStatus("s3b", "error");
     }
   }
 
@@ -400,7 +448,7 @@ export default function PocPage() {
     try {
       if (!state.passkeyB) throw new Error("Complete Step 3 first");
 
-      log("Loading existing Safe 0x1 with Passkey B credentials...");
+      log("Loading the original Safe with Passkey B credentials...");
       log(`rawId: ${state.passkeyB.rawId}`);
       log(`X: ${state.passkeyB.x}`);
       log(`Y: ${state.passkeyB.y}`);
@@ -415,7 +463,7 @@ export default function PocPage() {
 
       const match = addr.toLowerCase() === state.safeAddress.toLowerCase();
       log(`Address matches: ${match ? "✓ PASS" : "✗ FAIL"}`);
-      log(match ? "Passkey B can operate Safe 0x1 ✓" : "Mismatch: something went wrong ✗", !match);
+      log(match ? "Passkey B can operate the original Safe ✓" : "Mismatch: something went wrong ✗", !match);
       setState((s) => ({ ...s, loginOk: match }));
       setStatus("s5", "done");
     } catch (e: unknown) {
@@ -424,7 +472,7 @@ export default function PocPage() {
     }
   }
 
-  // ── Step 6: Send dummy UserOp from Passkey B on Safe 0x1 ────────────────
+  // ── Step 6: Send dummy UserOp from Passkey B on the original Safe ────────────────
 
   async function step6() {
     setStatus("s6", "loading");
@@ -522,7 +570,7 @@ export default function PocPage() {
   return (
     <div style={{ fontFamily: "monospace", padding: "24px", maxWidth: "720px", margin: "0 auto" }}>
       <h1 style={{ borderBottom: "1px solid #ccc", paddingBottom: "8px" }}>
-        PoC: Passkey Rotation via RecoveryModule
+        PoC: Passkey Rotation via RecoveryAuthorityModule
       </h1>
       <p style={{ color: "#666", fontSize: "13px" }}>
         SharedSigner: <code>0x94a4F6...5c2</code> · Module:{" "}
@@ -574,20 +622,34 @@ export default function PocPage() {
 
       {/* Step 2 */}
       <section style={sectionStyle}>
-        <h2>{icon(statuses["s2"])} Step 2: Setup Recovery Key</h2>
-        <p>Generates a random recovery EOA and registers it on the RecoveryModule via UserOp.</p>
-        {state.recoveryAddress && (
-          <>
-            <p>Recovery address: <code>{state.recoveryAddress}</code></p>
-            <p style={{ color: "#c00" }}>
-              ⚠ Save this private key: you need it in Step 3:<br />
-              <code style={{ wordBreak: "break-all" }}>{state.recoveryPrivateKey}</code>
-            </p>
-          </>
+        <h2>{icon(statuses["s2"])} Step 2: Set Up Your Recovery Authority</h2>
+        <p>Recovery is always yours: choose how YOU will authorize replacing a lost passkey. A rotation only executes after the delay, and the current passkey can cancel it meanwhile.</p>
+        <div style={{ margin: "8px 0", fontSize: "13px" }}>
+          <label><input type="radio" checked={authorityChoice === "key"} onChange={() => setAuthorityChoice("key")} disabled={state.recoverySetup} /> Recovery key + encrypted backup (default)</label>
+          <br />
+          <label><input type="radio" checked={authorityChoice === "passkey"} onChange={() => setAuthorityChoice("passkey")} disabled={state.recoverySetup} /> A second passkey of yours (another device or a security key; PIN or biometrics required)</label>
+          <br />
+          <label style={{ color: "#999" }}><input type="radio" disabled /> Biometric key (Rarimo Unforgettable): paused while Rarimo migrates</label>
+          <br />
+          <label style={{ color: "#999" }}><input type="radio" disabled /> Guardians m-of-n: optional, not available yet</label>
+        </div>
+        <div style={{ margin: "8px 0", fontSize: "13px" }}>
+          <label>Delay before a rotation can execute (seconds, min 60): </label>
+          <input type="number" min={60} value={delayInput} onChange={(e) => setDelayInput(e.target.value)} disabled={state.recoverySetup} style={{ width: "90px", fontFamily: "monospace", padding: "2px" }} />
+        </div>
+        {state.recoveryAddress && <p>Recovery key address: <code>{state.recoveryAddress}</code></p>}
+        {state.recoveryPasskey && (
+          <p style={{ fontSize: "12px" }}>Recovery passkey: x=<code>{state.recoveryPasskey.x.slice(0, 18)}…</code> (registered on-chain; keep that device or security key safe)</p>
         )}
-        {state.recoverySetup && <p style={okStyle}>Recovery configured ✓</p>}
+        {state.recoveryPrivateKey && (
+          <p style={{ color: "#c00" }}>
+            ⚠ Dev view of the recovery key (download the encrypted backup below instead of copying it):<br />
+            <code style={{ wordBreak: "break-all" }}>{state.recoveryPrivateKey}</code>
+          </p>
+        )}
+        {state.recoverySetup && <p style={okStyle}>Recovery authority configured ✓</p>}
         <button onClick={step2} disabled={!state.moduleEnabled || statuses["s2"] === "loading" || state.recoverySetup} style={btnStyle}>
-          {statuses["s2"] === "loading" ? "Working..." : "Generate & Setup"}
+          {statuses["s2"] === "loading" ? "Working..." : "Set up recovery"}
         </button>
         {state.recoverySetup && state.recoveryPrivateKey && (
           <div style={{ marginTop: "10px", fontSize: "13px" }}>
@@ -600,48 +662,67 @@ export default function PocPage() {
 
       {/* Step 3 */}
       <section style={sectionStyle}>
-        <h2>{icon(statuses["s3"])} Step 3: Rotate Passkey (simulate lost device)</h2>
-        <p>Obtains the recovery key (backup or pasted), checks it against the one registered on-chain, creates Passkey B, signs the recovery digest and relays the rotation. Works in a fresh session: the recovery key alone is enough, the Safe is found from its on-chain RecoverySetup event.</p>
+        <h2>{icon(statuses["s3"])} Step 3: Request Rotation (simulate lost device)</h2>
+        <p>Your recovery authority signs the rotation to a new Passkey B; anyone relays it. It becomes executable after the delay. Works in a fresh session.</p>
         <div style={{ margin: "8px 0" }}>
-          <label style={{ fontSize: "13px" }}>Safe to recover (optional):</label>
+          <label style={{ fontSize: "13px" }}>Safe to recover (optional with a recovery key; required with a recovery passkey):</label>
           <br />
           <input
             type="text"
-            placeholder={state.safeAddress || "0x... (optional: found from the recovery key if empty)"}
+            placeholder={state.safeAddress || "0x..."}
             value={s3SafeAddress}
             onChange={(e) => setS3SafeAddress(e.target.value)}
-            disabled={state.rotationDone}
+            disabled={state.requestDone}
             style={{ width: "100%", fontFamily: "monospace", fontSize: "12px", padding: "4px", marginTop: "4px" }}
           />
         </div>
         <div style={{ margin: "8px 0", fontSize: "13px" }}>
-          <label><input type="radio" checked={restoreSource === "backup"} onChange={() => setRestoreSource("backup")} disabled={state.rotationDone} /> Encrypted backup file + password</label>
+          <label><input type="radio" checked={restoreSource === "backup"} onChange={() => setRestoreSource("backup")} disabled={state.requestDone} /> Recovery key: encrypted backup file + password</label>
           <br />
-          <label><input type="radio" checked={restoreSource === "paste"} onChange={() => setRestoreSource("paste")} disabled={state.rotationDone} /> Paste the private key</label>
+          <label><input type="radio" checked={restoreSource === "paste"} onChange={() => setRestoreSource("paste")} disabled={state.requestDone} /> Recovery key: paste it</label>
+          <br />
+          <label><input type="radio" checked={restoreSource === "passkey"} onChange={() => setRestoreSource("passkey")} disabled={state.requestDone} /> Recovery passkey</label>
         </div>
-        {restoreSource === "backup" ? (
+        {restoreSource === "backup" && (
           <div style={{ margin: "8px 0", fontSize: "13px" }}>
             <input type="file" accept="application/json" onChange={async (e) => setImportFileText((await e.target.files?.[0]?.text()) ?? "")} />
             <br />
             <input type="password" placeholder="backup password" value={importPwd} onChange={(e) => setImportPwd(e.target.value)} style={{ fontFamily: "monospace", padding: "4px", marginTop: "6px" }} />
           </div>
-        ) : (
+        )}
+        {restoreSource === "paste" && (
           <div style={{ margin: "8px 0" }}>
-            <label style={{ fontSize: "13px" }}>Recovery private key (from Step 2):</label>
-            <br />
             <input
               type="text"
-              placeholder="0x..."
+              placeholder="0x... (recovery private key)"
               value={recoveryKeyInput}
               onChange={(e) => setRecoveryKeyInput(e.target.value)}
-              style={{ width: "100%", fontFamily: "monospace", fontSize: "12px", padding: "4px", marginTop: "4px" }}
+              style={{ width: "100%", fontFamily: "monospace", fontSize: "12px", padding: "4px" }}
             />
           </div>
         )}
+        {restoreSource === "passkey" && (
+          <p style={{ fontSize: "12px", color: "#666" }}>You will be asked to create Passkey B, then to sign with your recovery passkey.</p>
+        )}
         {state.passkeyB && <p>Passkey B created ✓ x={state.passkeyB.x.slice(0, 16)}...</p>}
-        {state.rotationDone && <p style={okStyle}>Rotation complete ✓</p>}
-        <button onClick={step3} disabled={(recoverSafe !== "" && !isAddress(recoverSafe)) || statuses["s3"] === "loading" || state.rotationDone} style={btnStyle}>
-          {statuses["s3"] === "loading" ? "Working..." : "Rotate Passkey"}
+        {state.requestDone && (
+          <p style={okStyle}>Rotation requested ✓ executable after {new Date(Number(state.executeAfter) * 1000).toISOString().slice(11, 19)} UTC</p>
+        )}
+        <button onClick={step3} disabled={(recoverSafe !== "" && !isAddress(recoverSafe)) || statuses["s3"] === "loading" || state.requestDone} style={btnStyle}>
+          {statuses["s3"] === "loading" ? "Working..." : "Request rotation"}
+        </button>
+      </section>
+
+      {/* Step 3b */}
+      <section style={sectionStyle}>
+        <h2>{icon(statuses["s3b"])} Step 3b: Execute After the Delay (or Cancel)</h2>
+        <p>Execute applies the rotation once the delay has passed (anyone can). Cancel needs the CURRENT passkey (Passkey A): it is how the owner stops an unwanted recovery.</p>
+        {state.rotationDone && <p style={okStyle}>Rotation executed ✓</p>}
+        <button onClick={executeRotation} disabled={!state.requestDone || statuses["s3b"] === "loading" || state.rotationDone} style={btnStyle}>
+          {statuses["s3b"] === "loading" ? "Working..." : "Execute rotation"}
+        </button>{" "}
+        <button onClick={cancelRotation} disabled={!state.requestDone || !packA || statuses["s3b"] === "loading" || state.rotationDone} style={btnStyle}>
+          Cancel (Passkey A)
         </button>
       </section>
 
@@ -684,7 +765,7 @@ export default function PocPage() {
 
       {/* Step 6 */}
       <section style={sectionStyle}>
-        <h2>{icon(statuses["s6"])} Step 6: Send UserOp with Passkey B on Safe 0x1 (standalone)</h2>
+        <h2>{icon(statuses["s6"])} Step 6: Send UserOp with Passkey B on the original Safe (standalone)</h2>
         <p>
           Usa <code>loadExistingSafe(passkeyB, safeAddress)</code> para enviar una tx real (0 ETH → 0xdead).
           Prueba si el problema de <code>verificationGasLimit</code> aparece en producción.
@@ -709,7 +790,7 @@ export default function PocPage() {
             </div>
           ))}
         </div>
-        {statuses["s6"] === "done" && <p style={okStyle}>UserOp executed with Passkey B on Safe 0x1 ✓</p>}
+        {statuses["s6"] === "done" && <p style={okStyle}>UserOp executed with Passkey B on the original Safe ✓</p>}
         <button onClick={step6} disabled={statuses["s6"] === "loading"} style={btnStyle}>
           {statuses["s6"] === "loading" ? "Working..." : "Send dummy UserOp"}
         </button>
