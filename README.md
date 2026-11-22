@@ -35,12 +35,19 @@ Safe (v1.5.0, ERC-4337 via Safe4337Module v0.3.0, EntryPoint v0.7)
       └─ stores (x, y, verifiers) in the Safe's own storage
            verifiers = (0x0100 << 160) | DaimoP256Verifier   (precompile first, Solidity fallback)
 
-RecoveryModule (enabled on the Safe)
- ├─ setupRecovery(recoveryKey)            called by the Safe
- └─ recover(safe, newX, newY, verifiers, sig)
-      ├─ checks an EIP-712 signature of the registered recovery key (with nonce)
-      └─ Safe.execTransactionFromModule(SharedSigner, configure(newX, newY, verifiers), DelegateCall)
+RecoveryAuthorityModule (enabled on the Safe; no admin, not upgradeable)
+ ├─ setupRecovery(signer, delay) / disableRecovery()     called by the Safe
+ │    signer = ERC-7913: an address (recovery key) or WebAuthnVerifier || qx || qy (recovery passkey)
+ ├─ request(safe, x, y, verifiers, sig)                  anyone relays; sig by the authority over
+ │                                                       EIP-712 Rotate(safe, x, y, verifiers, nonce)
+ ├─ cancel()                                             called by the Safe (current passkey) during the delay
+ └─ execute(safe)                                        anyone, after the delay:
+      └─ Safe.execTransactionFromModule(SharedSigner, configure(x, y, verifiers), DelegateCall)
 ```
+
+Recovery is always the user's own: the authority is a key the user keeps in an encrypted backup, or a second passkey of the user. Third-party guardians, if ever added, are optional.
+
+Deployed on Sepolia: `RecoveryAuthorityModule` [`0x7876…4373`](https://sepolia.etherscan.io/address/0x7876874cbe72a016b34e3116aebf052fea2f4373) (min delay 60 s) and the ERC-7913 `WebAuthnVerifier` [`0xc252…6522`](https://sepolia.etherscan.io/address/0xc252126da97330a30ec434ab5023f8c1efc06522). The previous `RecoveryModule` (no delay, EOA only) remains deployed but is no longer used by the app.
 
 `configure()` must run as a **DelegateCall** from the Safe: it writes to the Safe's own storage slot, not to the singleton's.
 
@@ -72,9 +79,9 @@ npm run build && npm run start
 # open http://localhost:3000 (use localhost: WebAuthn requires a secure context)
 ```
 
-The RecoveryModule is already deployed on Sepolia and registered in `constants.ts`. To use another network, deploy it there (`npx hardhat run scripts/deploy.ts --network <key>`, with `DEPLOYER_PRIVATE_KEY` funded on that network), add its address to the network entry and set `NEXT_PUBLIC_NETWORK`.
+The RecoveryAuthorityModule and the WebAuthn verifier are already deployed on Sepolia and registered in `constants.ts`. To use another network, deploy them there (`npx hardhat compile && npx tsx scripts/deploy-f2b.ts`, with `DEPLOYER_PRIVATE_KEY` funded on that network), add their addresses to the network entry and set `NEXT_PUBLIC_NETWORK`.
 
-Then follow steps 1 to 6 in the page. Copy the recovery private key shown in step 2: it is needed in step 3 and is not stored anywhere.
+Then follow the steps in the page: deploy (1), choose your recovery authority and the delay (2), request the rotation with it (3), wait for the delay and execute, or cancel with the current passkey (3b), then verify and use the new passkey (4 to 6). With a recovery key, download the encrypted backup in step 2.
 
 ## Lessons learned
 

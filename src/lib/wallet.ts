@@ -82,6 +82,19 @@ export async function loadExistingSafe(passkey: PasskeyArgType, safeAddress: str
   });
 }
 
+// Load a Safe that a UserOp has just deployed. Behind a load-balanced RPC the next read can hit a
+// node that does not see the new code yet ("SafeProxy contract is not deployed"), so retry.
+export async function loadJustDeployedSafe(passkey: PasskeyArgType, safeAddress: string): Promise<Safe4337Pack> {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await loadExistingSafe(passkey, safeAddress);
+    } catch (e) {
+      if (attempt >= 10) throw e;
+      await new Promise((r) => setTimeout(r, 1500));
+    }
+  }
+}
+
 export async function sendUserOp(
   pack: Safe4337Pack,
   transactions: { to: string; data: string; value: string }[],

@@ -60,9 +60,11 @@ export interface NetworkConfig {
   explorerUrl: string;
   /** Which P-256 precompile spec the network implements (gas differs). */
   p256Precompile: "EIP-7951" | "RIP-7212";
-  /** Our RecoveryModule on this network, if deployed, and the block to start log searches from. */
+  /** Our RecoveryAuthorityModule on this network, if deployed, and the block to start log searches from. */
   recoveryModule?: Address;
   recoveryModuleFromBlock?: bigint;
+  /** ERC-7913 WebAuthn verifier (OpenZeppelin), used when the recovery authority is a passkey. */
+  webAuthnVerifier?: Address;
 }
 
 export const NETWORKS: Record<NetworkKey, NetworkConfig> = {
@@ -74,8 +76,10 @@ export const NETWORKS: Record<NetworkKey, NetworkConfig> = {
     pimlicoSlug: "sepolia",
     explorerUrl: "https://sepolia.etherscan.io",
     p256Precompile: "EIP-7951",
-    recoveryModule: "0x0cc7d46dd3247aa14099bf4baf16d1798d7a12d3",
-    recoveryModuleFromBlock: 10_863_000n, // first RecoverySetup event at 10,863,681
+    // RecoveryAuthorityModule (F2b): ERC-7913 authority, delay and cancel. Deployed at block 12,190,655.
+    recoveryModule: "0x7876874cbe72a016b34e3116aebf052fea2f4373",
+    recoveryModuleFromBlock: 12_190_655n,
+    webAuthnVerifier: "0xc252126da97330a30ec434ab5023f8c1efc06522",
   },
 };
 
@@ -101,7 +105,11 @@ export const SAFE_SW_VERSION = VERSIONS.safe;
 export const SHARED_SIGNER_ADDRESS = CANONICAL.webAuthnSharedSigner;
 export const DAIMO_VERIFIER_ADDRESS = CANONICAL.daimoP256Verifier;
 
-/** RecoveryModule on the active network: env override, else the registry above. */
-export const RECOVERY_MODULE_ADDRESS = (process.env.NEXT_PUBLIC_RECOVERY_MODULE_ADDRESS ||
-  NETWORK.recoveryModule ||
-  "") as Address;
+/** RecoveryAuthorityModule on the active network (no env override: constants.ts is the only source). */
+export const RECOVERY_MODULE_ADDRESS = (NETWORK.recoveryModule ?? "") as Address;
+
+/** ERC-7913 WebAuthn verifier on the active network. */
+export const WEBAUTHN_VERIFIER_ADDRESS = (NETWORK.webAuthnVerifier ?? "") as Address;
+
+/** Default delay between a rotation request and its execution, for this PoC (>= MIN_DELAY = 60 s). */
+export const DEFAULT_RECOVERY_DELAY_SECONDS = 120n;
