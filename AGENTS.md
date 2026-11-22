@@ -23,7 +23,8 @@ This version has breaking changes: APIs, conventions, and file structure may all
 4. **Verify with a production build.** Use `npm run build && npm run start`, not the dev server, before reporting a change as working.
 5. **Testnet only.** Ethereum Sepolia, as listed in `constants.ts`.
 6. **Writing style.** Code, comments and docs in English. Do not use the em-dash character; use a comma, a colon or parentheses. No absolute local paths in committed files.
-7. **Git.** Do not commit, push, create branches or open pull requests unless the maintainer asks for it explicitly. Propose a commit message instead.
+7. **Formal model.** `formal/` holds a Lean 4 model of `RecoveryAuthorityModule` with proofs. Any change to the module's logic must be mirrored in `formal/RecoveryModel/Model.lean` and `lake build` must stay green.
+8. **Git.** Do not commit, push, create branches or open pull requests unless the maintainer asks for it explicitly. Propose a commit message instead.
 
 ## Checks before handing over
 
@@ -34,6 +35,7 @@ npx eslint src scripts
 npx hardhat compile
 npm run check:constants
 npm run build
+cd formal && lake build                  # Lean model and proofs, when the module changes
 ```
 
 The end-to-end flow (steps 1 to 6 in the page) needs a real passkey and a browser, so it is run by a person. When something fails on-chain, prefer reproducing it with `eth_call` or a state override over guessing.

@@ -1,0 +1,6 @@
+name = "recovery-model"
+version = "0.1.0"
+defaultTargets = ["RecoveryModel"]
+
+[[lean_lib]]
+name = "RecoveryModel"
